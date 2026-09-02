@@ -1,0 +1,19 @@
+# 키 — 절대 커밋 금지
+.key
+*.key
+
+# 원문 평문 PDF. .enc 만 올린다
+papers/*.pdf
+!papers/*.pdf.enc
+
+# 렌더링한 페이지 이미지
+*.png
+*.jpg
+render/
+scratch/
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+Thumbs.db
