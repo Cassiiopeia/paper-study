@@ -1,0 +1,42 @@
+{
+  "metadata": {
+    "lastUpdated": "2026-09-03T05:19:55Z",
+    "currentVersion": "0.1.0",
+    "projectTypes": [
+      "basic"
+    ],
+    "totalReleases": 1
+  },
+  "releases": [
+    {
+      "version": "0.1.0",
+      "project_types": [
+        "basic"
+      ],
+      "date": "2026-09-03",
+      "pr_number": 3,
+      "raw_summary": "## [0.1.0]\n\n### ✨ 기능\n- 논문 튜터 같이 읽기 방식으로 재설계 — 덩어리 루프, 직접 교정, 다시 쓰기 규칙으로 CLAUDE.md와 /tutor 개정, vault가 text/ 텍스트와 쪽 이미지도 봉하도록 확장(테스트 포함), 튜터 플레이북과 로그 신설, 노트 틀 개편, 원문 25쪽 옮겨 적기와 그림·표 쪽 이미지 11장 봉함\n\n### 📝 문서\n- 논문 튜터 같이 읽기 방식으로 재설계 — 이슈 #1 파이프라인 도입과 #2 튜터 재설계 구현 보고서 저장\n\n### 🔧 변경사항\n- projectops 릴리스 파이프라인 도입 — project-auto-wizard basic 설치로 공통 워크플로우 6개, 헬퍼 스크립트, version.yml, README 버전 섹션 추가",
+      "parsed_changes": {
+        "기능": {
+          "title": "✨ 기능",
+          "items": [
+            "논문 튜터 같이 읽기 방식으로 재설계 — 덩어리 루프, 직접 교정, 다시 쓰기 규칙으로 CLAUDE.md와 /tutor 개정, vault가 text/ 텍스트와 쪽 이미지도 봉하도록 확장(테스트 포함), 튜터 플레이북과 로그 신설, 노트 틀 개편, 원문 25쪽 옮겨 적기와 그림·표 쪽 이미지 11장 봉함"
+          ]
+        },
+        "문서": {
+          "title": "📝 문서",
+          "items": [
+            "논문 튜터 같이 읽기 방식으로 재설계 — 이슈 #1 파이프라인 도입과 #2 튜터 재설계 구현 보고서 저장"
+          ]
+        },
+        "변경사항": {
+          "title": "🔧 변경사항",
+          "items": [
+            "projectops 릴리스 파이프라인 도입 — project-auto-wizard basic 설치로 공통 워크플로우 6개, 헬퍼 스크립트, version.yml, README 버전 섹션 추가"
+          ]
+        }
+      },
+      "parse_method": "markdown"
+    }
+  ]
+}
