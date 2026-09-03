@@ -1,0 +1,357 @@
+# project-auto-wizard:managed-workflow
+# ===================================================================
+# PROJECT-COMMON-AUTO-CHANGELOG-CONTROL.yaml
+# Release PR pipeline: version confirm + AI changelog + automerge
+# ===================================================================
+#
+# Runs on release PRs (develop -> main) and:
+# 1. Confirms the release version and syncs every version file:
+#    - If version.yml metadata.template.options.semver_auto is true
+#      (default): classifies commits (feat -> minor, `!` marker -> major,
+#      else patch; AI-assisted patch->minor upgrade for unclassified
+#      commits) and bumps accordingly.
+#    - Otherwise: always patch+1 (legacy behavior).
+# 2. Generates the release summary locally with changelog_manager.py
+#    ai-summary (engine chain: user API key -> GitHub Models -> rule-based
+#    fallback; always succeeds, no third-party service involved)
+#    - The AI prompt includes commit subjects plus a capped
+#      `git diff --stat` (file-level change summary, no diff body)
+#      for richer context without token-cost blowup.
+# 3. Posts the same summary as a PR comment (this replaces
+#    PROJECT-COMMON-AI-PR-SUMMARY for release PRs, which skips them —
+#    that workflow would otherwise post the pre-bump version, since it
+#    runs before this job's version-confirm commit lands and that
+#    commit's GITHUB_TOKEN push doesn't retrigger pull_request events)
+# 4. Updates CHANGELOG.json / CHANGELOG.md and commits to the PR head
+#    branch with [skip ci]
+# 5. Enables automerge (gh pr merge --auto --merge)
+#
+# The merge-commit subject carries the release-confirm pattern
+# "chore(release):" — keep in sync with PROJECT-COMMON-VERSION-CONTROL
+# and PROJECT-COMMON-RELEASE-PUBLISH.
+#
+# Optional secrets/vars:
+# - secrets.WORKFLOW_PAT: PAT used for the merge. Without it the merge is
+#   performed with GITHUB_TOKEN, and GitHub will NOT trigger downstream
+#   main-push workflows (e.g. RELEASE-PUBLISH) for that merge.
+# - secrets.AI_API_KEY (+ vars.AI_API_BASE_URL / vars.AI_MODEL): preferred
+#   summary engine. Falls back to GitHub Models, then to rule-based.
+#
+# Issue #90: without WORKFLOW_PAT, a wait-for-merge-and-trigger-release job
+# polls until the automerge actually lands, then wakes RELEASE-PUBLISH via
+# workflow_dispatch — GITHUB_TOKEN can always trigger that event, unlike
+# the push/release events blocked by GitHub's anti-recursion policy.
+# ===================================================================
+
+name: PROJECT-AUTO-CHANGELOG-CONTROL
+
+concurrency:
+  group: auto-changelog-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+# No workflow_dispatch: this pipeline needs a live PR context and would be
+# a dead lever without one. The manual recovery path is
+# PROJECT-RELEASE-PUBLISH's workflow_dispatch.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: ["main"]
+
+permissions:
+  contents: write
+  pull-requests: write
+  models: read
+
+jobs:
+  changelog-and-merge:
+    name: Version confirm + changelog + automerge
+    # Guard: only release PRs whose head is the develop branch of THIS
+    # repository enter the pipeline (protects against accidental feature
+    # PRs opened against production and against fork PRs with a spoofed
+    # "develop" head ref).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Git config
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Read semver_auto option from version.yml
+        id: semver_options
+        run: |
+          SEMVER_AUTO=$(python3 -c 'import re; t=open("version.yml",encoding="utf-8").read(); m=re.search(r"metadata:.*?template:.*?options:.*?semver_auto:\s*\"?(true|false)", t, re.S); print(m.group(1) if m else "false")' 2>/dev/null || echo "false")
+          echo "semver_auto=$SEMVER_AUTO" >> $GITHUB_OUTPUT
+          echo "semver_auto option: $SEMVER_AUTO"
+
+      - name: Collect commits since last release
+        id: collect
+        run: |
+          git fetch origin main
+          git log --pretty=%s "origin/main..HEAD" > commits.txt
+          git diff --stat "origin/main...HEAD" > _full_diff_stat.txt
+          if [ "$(wc -l < _full_diff_stat.txt)" -gt 49 ]; then
+            { head -49 _full_diff_stat.txt; tail -1 _full_diff_stat.txt; } > diff_stat.txt
+          else
+            cp _full_diff_stat.txt diff_stat.txt
+          fi
+          rm -f _full_diff_stat.txt
+          echo "commits to summarize: $(wc -l < commits.txt)"
+
+      - name: Collect issues merged into develop
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git log --pretty=%H "origin/main..HEAD" > commit_shas.txt
+
+          gh pr list --state merged --base develop \
+            --json number,headRefName,mergeCommit --limit 200 > merged_prs.json
+
+          MERGED_PR_COUNT=$(python3 -c "import json; print(len(json.load(open('merged_prs.json'))))")
+          if [ "$MERGED_PR_COUNT" -ge 200 ]; then
+            echo "::warning::gh pr list가 --limit 200에 도달했습니다 — 오래된 병합 PR이 누락됐을 수 있습니다 (조회된 PR: $MERGED_PR_COUNT)"
+          fi
+
+          ISSUE_NUMBERS=$(python3 .github/scripts/changelog_manager.py collect-issue-closes \
+            --commit-shas-file commit_shas.txt \
+            --merged-prs-file merged_prs.json)
+
+          rm -f commit_shas.txt merged_prs.json
+
+          if [ -z "$ISSUE_NUMBERS" ]; then
+            echo "이번 릴리스에 연결할 이슈 없음 — 건너뜀"
+            exit 0
+          fi
+
+          python3 .github/scripts/issue_helper.py link-pr-issues \
+            --pr ${{ github.event.pull_request.number }} \
+            --issue-numbers "$ISSUE_NUMBERS" \
+            --replace
+
+          echo "이슈 연결: $ISSUE_NUMBERS"
+
+      - name: Confirm release version (bump + sync)
+        id: bump
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_BASE_URL: ${{ vars.AI_API_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Idempotency: if the PR head is already this workflow's own
+          # version-confirm commit (re-run / synchronize retrigger), do not
+          # bump a second time — reuse the confirmed version.
+          HEAD_MSG=$(git log -1 --pretty=%s)
+          if printf '%s\n' "$HEAD_MSG" | grep -q "^chore(version): confirm v.* \[skip ci\]"; then
+            NEW_VERSION=$(python3 .github/scripts/version_manager.py get | tail -n 1)
+            echo "version already confirmed by a previous run — reusing $NEW_VERSION (no re-increment)"
+          else
+            if [ "${{ steps.semver_options.outputs.semver_auto }}" = "true" ]; then
+              BUMP=$(python3 .github/scripts/changelog_manager.py classify-bump --commits-file commits.txt | tail -n 1)
+            else
+              BUMP="patch"
+            fi
+            echo "bump level: $BUMP"
+            NEW_VERSION=$(python3 .github/scripts/version_manager.py increment --bump "$BUMP" | tail -n 1)
+            if [ -z "$NEW_VERSION" ]; then
+              echo "version bump failed"
+              exit 1
+            fi
+            python3 .github/scripts/version_manager.py sync
+            echo "release version confirmed: $NEW_VERSION ($BUMP)"
+          fi
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate summary with the AI engine chain
+        env:
+          # PR title goes through the env block — never inline-interpolate
+          # untrusted text into the shell string (quote injection).
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_BASE_URL: ${{ vars.AI_API_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python3 .github/scripts/version_manager.py get | tail -n 1)
+
+          python3 .github/scripts/changelog_manager.py ai-summary \
+            --commits-file commits.txt \
+            --version "$VERSION" \
+            --output summary.md \
+            --pr-title "$PR_TITLE" \
+            --diff-stat-file diff_stat.txt
+
+          # update-from-summary reads ./pr_body.md
+          cp summary.md pr_body.md
+
+      - name: Post AI summary comment
+        continue-on-error: true
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          {
+            echo "🤖 **AI Summary (project-auto-wizard)**"
+            echo ""
+            cat summary.md
+          } > comment_body.md
+
+          python3 -c 'import json; print(json.dumps({"body": open("comment_body.md", encoding="utf-8").read()}))' > comment_payload.json
+
+          curl -sf -H "Authorization: token ${{ github.token }}" \
+               -H "Content-Type: application/json" \
+               -X POST \
+               -d @comment_payload.json \
+               "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" > /dev/null \
+            || echo "comment post failed — continuing (this workflow never blocks the release)"
+
+          rm -f comment_body.md comment_payload.json
+
+      - name: Update CHANGELOG from summary
+        run: |
+          # note: `grep | sed || echo default` never fires the default (the
+          # pipeline exits with sed's 0) — default via ${var:-} instead
+          PROJECT_TYPES=$(grep "^project_types:" version.yml 2>/dev/null | sed -E 's/.*\[([^]]*)\].*/\1/' | tr -d '" ')
+          PROJECT_TYPES=${PROJECT_TYPES:-unknown}
+
+          export VERSION="${{ steps.bump.outputs.new_version }}"
+          export PROJECT_TYPES
+          export TODAY=$(date '+%Y-%m-%d')
+          export PR_NUMBER="${{ github.event.pull_request.number }}"
+          export TIMESTAMP=$(date '+%Y-%m-%dT%H:%M:%SZ')
+
+          python3 .github/scripts/changelog_manager.py update-from-summary
+          python3 .github/scripts/changelog_manager.py generate-md
+
+      - name: Commit release docs to the PR head branch
+        run: |
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${{ steps.bump.outputs.new_version }}"
+
+          # Working files must not land in the repo
+          rm -f pr_body.md summary.md commits.txt diff_stat.txt comment_body.md comment_payload.json commit_shas.txt merged_prs.json
+
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "chore(version): confirm v${VERSION} and update release docs [skip ci]"
+
+            # Race-condition guard: pull-rebase then push (up to 3 retries)
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            PUSH_SUCCESS=false
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "push attempt $RETRY_COUNT/$MAX_RETRIES..."
+
+              if git push origin HEAD:$HEAD_BRANCH; then
+                PUSH_SUCCESS=true
+                echo "release docs pushed to $HEAD_BRANCH"
+                break
+              else
+                echo "push failed, syncing with remote..."
+                if git pull --rebase origin $HEAD_BRANCH; then
+                  echo "rebase ok, retrying push..."
+                else
+                  echo "rebase failed, manual conflict resolution required"
+                  git rebase --abort 2>/dev/null || true
+                  exit 1
+                fi
+              fi
+            done
+
+            if [ "$PUSH_SUCCESS" = false ]; then
+              echo "push failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
+          fi
+
+      - name: Enable automerge
+        env:
+          # With a PAT the merge push triggers downstream workflows
+          # (RELEASE-PUBLISH etc.); GITHUB_TOKEN merges do not.
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || github.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          VERSION="${{ steps.bump.outputs.new_version }}"
+
+          # Merge-commit subject carries the release-confirm pattern —
+          # VERSION-CONTROL skips on it and RELEASE-PUBLISH proceeds on it.
+          SUBJECT="chore(release): v${VERSION} (PR #${PR_NUMBER})"
+
+          if gh pr merge "$PR_NUMBER" --auto --merge --subject "$SUBJECT"; then
+            echo "automerge enabled: $SUBJECT"
+          elif gh pr merge "$PR_NUMBER" --merge --subject "$SUBJECT"; then
+            echo "automerge unavailable — merged directly: $SUBJECT"
+          else
+            # Both attempts failed — diagnose instead of pretending success.
+            ALLOW_MERGE_COMMIT=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.allow_merge_commit' 2>/dev/null || echo "unknown")
+            if [ "$ALLOW_MERGE_COMMIT" = "false" ]; then
+              echo "::error::이 레포는 merge commit이 비활성화되어 있습니다 — Settings에서 'Allow merge commits'를 켜세요; 릴리스 감지는 merge commit subject를 사용합니다"
+            else
+              echo "::error::PR merge failed (allow_merge_commit=$ALLOW_MERGE_COMMIT) — check branch protection rules, required checks, and token permissions"
+            fi
+            exit 1
+          fi
+
+  wait-for-merge-and-trigger-release:
+    name: Wait for merge and trigger RELEASE-PUBLISH (WORKFLOW_PAT 없이도 동작)
+    needs: changelog-and-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      pull-requests: read
+      actions: write
+    steps:
+      - name: Poll for merge completion
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          MAX_WAIT=1800
+          INTERVAL=20
+          ELAPSED=0
+          MERGED=false
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            PR_STATE=$(gh pr view "$PR_NUMBER" --json state -q .state 2>/dev/null || echo "")
+            if [ "$PR_STATE" = "MERGED" ]; then
+              MERGED=true
+              echo "PR #$PR_NUMBER 병합 확인 (경과 ${ELAPSED}s)"
+              break
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ "$MERGED" != "true" ]; then
+            echo "::warning::PR #$PR_NUMBER 병합을 ${MAX_WAIT}s 내에 확인하지 못했습니다 — RELEASE-PUBLISH 자동 트리거를 건너뜁니다. WORKFLOW_PAT이 등록되어 있다면 기존 경로로 정상 진행되며, 없다면 필요 시 RELEASE-PUBLISH를 수동으로 workflow_dispatch 하세요."
+          fi
+
+          echo "merged=$MERGED" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger RELEASE-PUBLISH
+        if: steps.wait.outputs.merged == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run PROJECT-COMMON-RELEASE-PUBLISH.yaml --ref main
+          echo "RELEASE-PUBLISH workflow_dispatch 트리거 요청 완료 (WORKFLOW_PAT 없이도 동작)"

@@ -6,6 +6,9 @@
 papers/*.pdf
 !papers/*.pdf.enc
 
+# 원문 옮겨 적은 평문. .enc 만 올린다 (.md.enc 는 *.md 에 안 걸린다)
+text/**/*.md
+
 # 렌더링한 페이지 이미지
 *.png
 *.jpg
